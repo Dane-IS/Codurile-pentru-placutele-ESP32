@@ -1,119 +1,163 @@
 #include <esp_now.h>
 #include <WiFi.h>
-#include <esp_wifi.h> 
+#include <PubSubClient.h>
+#include <Preferences.h>
 
-// --- 1. CONFIGURARE PINI ---
-const int PIN_POMPA = 26;      
-#define sensorPower 4          
-#define sensorPin_umiditate_sol 36  
-#define sensorPin_water_level 39      
+const char* ssid = "Nume_retea";
+const char* password = "Parola_retea";
+const char* mqtt_server = "broker.emqx.io"; 
 
-// Adresa MAC a Masterului
-uint8_t adresaMaster[] = {0xB0, 0xCB, 0xD8, 0xE6, 0x1A, 0x48}; 
+const char* topic_slave1_date = "esp32/slave1/date";
+const char* topic_slave2_date = "esp32/slave2/date";
+const char* topic_slave1_cmd = "esp32/slave1/comenzi";
+const char* topic_slave2_cmd = "esp32/slave2/comenzi";
+const char* topic_slave1_auto = "esp32/slave1/auto"; // Adăugat topic auto Slave 1
+const char* topic_slave2_auto = "esp32/slave2/auto"; 
+const char* topic_istoric = "esp32/istoric"; 
 
-bool masterGasit = false;
-int canalCurent = 1;
-esp_now_peer_info_t infoMaster = {};
+uint8_t adresaSlave1[] = {0x70, 0x4B, 0xCA, 0x27, 0x87, 0xB0};
+uint8_t adresaSlave2[] = {0x1C, 0xC3, 0xAB, 0xF9, 0xEC, 0xD4};
 
-void onDateTrimise(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  masterGasit = (status == ESP_NOW_SEND_SUCCESS);
-}
+WiFiClient espClient;
+PubSubClient clientMQTT(espClient);
+Preferences preferinte;
 
-// --- COMANDA PENTRU POMPĂ ---
-void onDatePrimite(const esp_now_recv_info_t *info, const uint8_t *date, int lungime) {
-  char buffer[lungime + 1];
-  memcpy(buffer, date, lungime);
-  buffer[lungime] = '\0';
-  String comanda = String(buffer);
+// --- VARIABILE PENTRU AMBELE ZONE ---
+bool autoSlave1Active = false;
+bool seUdaAcum1 = false; 
 
-  Serial.println("Comandă primită pentru Slave 1: " + comanda);
+bool autoSlave2Active = false;
+bool seUdaAcum2 = false; 
 
-  if (comanda == "PORNESTE_UDARE") {
-    pinMode(PIN_POMPA, OUTPUT);
-    digitalWrite(PIN_POMPA, LOW);  
-    Serial.println(">>> POMPA 1 PORNIȚĂ");
+void callbackMQTT(char* topic, byte* payload, unsigned int length) {
+  String mesaj = "";
+  for (int i = 0; i < length; i++) mesaj += (char)payload[i];
+  
+  //  mod AUTO pentru SLAVE 1
+  if (String(topic) == topic_slave1_auto) {
+    autoSlave1Active = (mesaj == "1"); 
+    preferinte.putBool("auto1", autoSlave1Active); 
+  }
+  //  mod AUTO pentru SLAVE 2
+  else if (String(topic) == topic_slave2_auto) {
+    autoSlave2Active = (mesaj == "1"); 
+    preferinte.putBool("auto2", autoSlave2Active); 
+  }
+  // Comenzi manuale Slave 1 & Slave 2
+  else if (String(topic) == topic_slave1_cmd) {
+    esp_now_send(adresaSlave1, (uint8_t *) mesaj.c_str(), mesaj.length());
   } 
-  else if (comanda == "OPRESTE_UDARE") {
-    pinMode(PIN_POMPA, INPUT);     
-    Serial.println(">>> POMPA 1 OPRITĂ");
+  else if (String(topic) == topic_slave2_cmd) {
+    esp_now_send(adresaSlave2, (uint8_t *) mesaj.c_str(), mesaj.length());
   }
 }
 
-// --- FUNCȚIA DE CĂUTARE MASTER ---
-void cautaMaster() {
-  while (!masterGasit) {
-    canalCurent++;
-    if (canalCurent > 13) canalCurent = 1;
-    esp_wifi_set_channel(canalCurent, WIFI_SECOND_CHAN_NONE);
-    esp_now_del_peer(adresaMaster);
-    infoMaster.channel = canalCurent;
-    esp_now_add_peer(&infoMaster);
-    
-    String ping = "ping1"; 
-    esp_now_send(adresaMaster, (uint8_t *) ping.c_str(), ping.length());
-    
-    delay(150); 
-    if (masterGasit) break; 
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  char buffer[len + 1];
+  memcpy(buffer, incomingData, len);
+  buffer[len] = '\0';
+  String mesajText = String(buffer);
+
+  // --- LOGICA PENTRU  UDARE AUTOMATĂ SLAVE 2 ---
+  if (memcmp(info->src_addr, adresaSlave2, 6) == 0) {
+    clientMQTT.publish(topic_slave2_date, mesajText.c_str());
+
+    int lPos = mesajText.indexOf("L:");
+    int uPos = mesajText.indexOf("U:");
+    if (lPos != -1 && uPos != -1) {
+      int nivelApa = mesajText.substring(lPos + 2, mesajText.indexOf(",", lPos)).toInt();
+      int umiditate = mesajText.substring(uPos + 2).toInt();
+
+      if (autoSlave2Active && nivelApa >= 20) {
+        if (umiditate <= 30 && !seUdaAcum2) { 
+          String cmd = "PORNESTE_UDARE";
+          esp_now_send(adresaSlave2, (uint8_t *) cmd.c_str(), cmd.length());
+          seUdaAcum2 = true;
+          clientMQTT.publish(topic_istoric, "START_2"); 
+        } 
+        else if (umiditate >= 80 && seUdaAcum2) { 
+          String cmd = "OPRESTE_UDARE";
+          esp_now_send(adresaSlave2, (uint8_t *) cmd.c_str(), cmd.length());
+          seUdaAcum2 = false;
+        }
+      }
+      if (nivelApa < 20) { 
+        String cmd = "OPRESTE_UDARE";
+        esp_now_send(adresaSlave2, (uint8_t *) cmd.c_str(), cmd.length());
+        seUdaAcum2 = false;
+      }
+    }
+  }
+
+  // --- LOGICA PENTRU UDARE AUTOMATĂ SLAVE 1 ---
+  else if (memcmp(info->src_addr, adresaSlave1, 6) == 0) {
+    clientMQTT.publish(topic_slave1_date, mesajText.c_str());
+
+    int lPos = mesajText.indexOf("L:");
+    int uPos = mesajText.indexOf("U:");
+    if (lPos != -1 && uPos != -1) {
+      int nivelApa = mesajText.substring(lPos + 2, mesajText.indexOf(",", lPos)).toInt();
+      int umiditate = mesajText.substring(uPos + 2).toInt();
+
+      if (autoSlave1Active && nivelApa >= 20) {
+        if (umiditate <= 30 && !seUdaAcum1) { 
+          String cmd = "PORNESTE_UDARE";
+          esp_now_send(adresaSlave1, (uint8_t *) cmd.c_str(), cmd.length());
+          seUdaAcum1 = true;
+          clientMQTT.publish(topic_istoric, "START_1"); // Trimitem istoric pentru 1
+        } 
+        else if (umiditate >= 80 && seUdaAcum1) { 
+          String cmd = "OPRESTE_UDARE";
+          esp_now_send(adresaSlave1, (uint8_t *) cmd.c_str(), cmd.length());
+          seUdaAcum1 = false;
+        }
+      }
+      if (nivelApa < 20) { 
+        String cmd = "OPRESTE_UDARE";
+        esp_now_send(adresaSlave1, (uint8_t *) cmd.c_str(), cmd.length());
+        seUdaAcum1 = false;
+      }
+    }
   }
 }
 
 void setup() {
   Serial.begin(9600);
+  preferinte.begin("sistemIrigatii", false); 
   
-  // Pompa stă oprită 
-  pinMode(PIN_POMPA, INPUT); 
-
-  pinMode(sensorPower, OUTPUT);
-  digitalWrite(sensorPower, LOW);
-
+  autoSlave1Active = preferinte.getBool("auto1", false); 
+  autoSlave2Active = preferinte.getBool("auto2", false); 
+  
   WiFi.mode(WIFI_STA);
-  if (esp_now_init() != ESP_OK) return;
-  esp_now_register_send_cb((esp_now_send_cb_t)onDateTrimise);
-  esp_now_register_recv_cb((esp_now_recv_cb_t)onDatePrimite);
-
-  memcpy(infoMaster.peer_addr, adresaMaster, 6);
-  infoMaster.encrypt = false;
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
   
-  Serial.println("Slave 1 pornit. Căutare Master...");
-  cautaMaster(); 
+  clientMQTT.setServer(mqtt_server, 1883);
+  clientMQTT.setCallback(callbackMQTT);
+  
+  esp_now_init();
+  esp_now_register_recv_cb((esp_now_recv_cb_t)onDataRecv);
+  
+  esp_now_peer_info_t peerInfo = {};
+  peerInfo.channel = WiFi.channel();
+  peerInfo.encrypt = false;
+  
+  // Adăugăm AMBELE plăci Slave
+  memcpy(peerInfo.peer_addr, adresaSlave1, 6);
+  esp_now_add_peer(&peerInfo);
+  
+  memcpy(peerInfo.peer_addr, adresaSlave2, 6);
+  esp_now_add_peer(&peerInfo);
 }
 
 void loop() {
-  if (masterGasit) {
-    // 1. Citire Senzori
-    digitalWrite(sensorPower, HIGH);
-    delay(50); 
-    int rawUmiditate = analogRead(sensorPin_umiditate_sol);
-    int rawNivel = analogRead(sensorPin_water_level);
-    digitalWrite(sensorPower, LOW);
-
-    // 2. Diagnostic în Serial Monitor
-    String stareSol = "";
-    if(rawUmiditate >= 4000) stareSol = "Senzorul 1 nu este in sol";
-    else if(rawUmiditate >= 2400) stareSol = "Sol 1: USCAT";
-    else if(rawUmiditate >= 1480) stareSol = "Sol 1: UMED";
-    else stareSol = "Senzor 1 in APA";
-
-    Serial.println(stareSol);
-    
-    // 3. Calcul Procentaje
-    // Nivel apă (0 uscat -> 2100 plin)
-    int procentNivel = map(rawNivel, 0, 2100, 0, 100); 
-    // Umiditate sol (4000 uscat -> 1480 ud)
-    int procentUmiditate = map(rawUmiditate, 4000, 1480, 0, 100);
-
-    procentNivel = constrain(procentNivel, 0, 100);
-    procentUmiditate = constrain(procentUmiditate, 0, 100);
-
-    // 4. Trimitere date către Master
-    String mesaj = "L:" + String(procentNivel) + ",U:" + String(procentUmiditate);
-    esp_now_send(adresaMaster, (uint8_t *) mesaj.c_str(), mesaj.length());
-    
-    Serial.println("Slave 1 Trimis: " + mesaj);
-    Serial.println("-------------------------");
-    
-    delay(3000); 
-  } else {
-    cautaMaster();
+  if (!clientMQTT.connected()) {
+    if (clientMQTT.connect("MasterAlex")) {
+      clientMQTT.subscribe(topic_slave1_cmd);
+      clientMQTT.subscribe(topic_slave2_cmd);
+      clientMQTT.subscribe(topic_slave1_auto); // Abonare la comutatorul 1
+      clientMQTT.subscribe(topic_slave2_auto); // Abonare la comutatorul 2
+    }
   }
+  clientMQTT.loop();
 }
